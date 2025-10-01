@@ -15,7 +15,9 @@ const PORT = process.env.PORT || 5000;
 
 // ---------- MIDDLEWARE ----------
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: "http://localhost:8080", // linking fortened server during development
+}));
 
 // ---------- MONGODB ----------
 mongoose
