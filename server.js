@@ -69,6 +69,20 @@ app.get("/api/samples", async (req, res) => {
   }
 });
 
+// Route to get sample by ID
+app.get('/api/samples/:id', async (req, res) => {
+  try {
+    const sample = await Sample.findOne({ sampleId: req.params.id });
+    if (!sample) {
+      return res.status(404).json({ message: 'Sample not found' });
+    }
+    res.json(sample);
+  } catch (error) {
+    console.error('Error fetching sample:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ✅ 3. Summary stats
 app.get("/api/summary", async (req, res) => {
   try {
