@@ -4,6 +4,8 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
 const csv = require("csvtojson");
+const { Parser } = require('json2csv');
+const PDFDocument = require('pdfkit');
 require("dotenv").config();
 
 const computeIndices = require("./utils/calculateIndices");
@@ -14,7 +16,8 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ---------- MIDDLEWARE ----------
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cors({
   origin: "http://localhost:8080", // linking fortened server during development
 }));
@@ -83,6 +86,7 @@ app.get('/api/samples/:id', async (req, res) => {
   }
 });
 
+
 // ✅ 3. Summary stats
 app.get("/api/summary", async (req, res) => {
   try {
@@ -118,6 +122,8 @@ app.get("/api/summary", async (req, res) => {
 const upload = multer({ dest: "uploads/" });
 
 app.post("/api/upload", upload.single("file"), async (req, res) => {
+  const fs = require("fs");
+
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -126,13 +132,18 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
     const jsonArray = await csv().fromFile(req.file.path);
     console.log("First row of CSV:", jsonArray[0]); // DEBUG
 
-    const docs = jsonArray.map((row, index) => {
-      // Parse coordinates with multiple fallbacks
+    // 🔥 Delete all existing samples before inserting new ones
+    await Sample.deleteMany({});
+    console.log("🧹 Cleared existing samples");
+
+    let insertedCount = 0;
+
+    for (let index = 0; index < jsonArray.length; index++) {
+      const row = jsonArray[index];
+
       const lat = parseFloat(row.Latitude || row.LAT || row.latitude) || 0;
       const lng = parseFloat(row.Longitude || row.LONG || row.longitude) || 0;
-      console.log(`Row ${index}: Lat=${lat}, Lng=${lng}`);
 
-      // --- Basic water quality (non-metals) ---
       const waterQuality = {
         pH: parseFloat(row.pH) || 7,
         tds: parseFloat(row["EC (µS/cm at 25 °C)"]) || 0,
@@ -141,37 +152,23 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
         nitrate: parseFloat(row["NO3 (mg/L)"]) || 0,
       };
 
-      // --- Metals block ---
       const metals = {
-        // Given as ppb → convert to mg/L
-        arsenic: row["As (ppb)"] && row["As (ppb)"] !== "-"
-          ? parseFloat(row["As (ppb)"]) / 1000
-          : 0,
-
-        uranium: row["U (ppb)"] && row["U (ppb)"] !== "-"
-          ? parseFloat(row["U (ppb)"]) / 1000
-          : 0,
-
-        // Iron already in ppm (≈ mg/L)
-        iron: row["Fe (ppm)"] && row["Fe (ppm)"] !== "-"
-          ? parseFloat(row["Fe (ppm)"])
-          : 0,
-
-        // CSV doesn’t have these, set 0 for now
-        lead: 0,
-        cadmium: 0,
-        chromium: 0,
-        mercury: 0,
+        arsenic: row["As (ppb)"] && row["As (ppb)"] !== "-" ? parseFloat(row["As (ppb)"]) / 1000 : 0,
+        uranium: row["U (ppb)"] && row["U (ppb)"] !== "-" ? parseFloat(row["U (ppb)"]) / 1000 : 0,
+        iron: row["Fe (ppm)"] && row["Fe (ppm)"] !== "-" ? parseFloat(row["Fe (ppm)"]) : 0,
+        lead: row["Pb (ppm)"] && row["Pb (ppm)"] !== "-" ? parseFloat(row["Pb (ppm)"]) : 0,
+        cadmium: row["Cd (ppm)"] && row["Cd (ppm)"] !== "-" ? parseFloat(row["Cd (ppm)"]) : 0,
+        chromium: row["Cr (ppm)"] && row["Cr (ppm)"] !== "-" ? parseFloat(row["Cr (ppm)"]) : 0,
+        mercury: row["Hg (ppm)"] && row["Hg (ppm)"] !== "-" ? parseFloat(row["Hg (ppm)"]) : 0,
       };
 
-      // Remove negatives → set to 0
       Object.keys(metals).forEach((m) => {
         if (metals[m] < 0 || isNaN(metals[m])) metals[m] = 0;
       });
 
-      // --- Build sample object ---
+      const sampleId = row["S. No."] || `SAMPLE-${Date.now()}-${index}`;
       const sampleData = {
-        sampleId: row["S. No."] || `SAMPLE-${Date.now()}-${index}`,
+        sampleId,
         state: row.State || "",
         district: row.District || "",
         block: "",
@@ -184,11 +181,10 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
         metals,
         location: {
           type: "Point",
-          coordinates: [lng, lat], // IMPORTANT: [lng, lat]
+          coordinates: [lng, lat],
         },
       };
 
-      // Compute indices
       const indices = computeIndices({ metals });
       sampleData.indices = {
         hpi: indices.hpi,
@@ -197,28 +193,198 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       };
       sampleData.category = indices.category;
 
-      return sampleData;
-    });
+      await Sample.create(sampleData);
+      insertedCount++;
+    }
 
-    // Insert into Mongo
-    const result = await Sample.insertMany(docs, { ordered: false });
-
-    // Delete uploaded file
-    const fs = require("fs");
     fs.unlinkSync(req.file.path);
 
-    console.log(`✅ Successfully uploaded ${result.length} samples`);
+    console.log(`✅ Uploaded: ${insertedCount} new samples`);
     res.json({
-      message: "✅ Bulk upload successful",
-      count: result.length,
+      message: "✅ Upload complete",
+      inserted: insertedCount,
+      updated: 0,
     });
   } catch (err) {
     console.error("Upload error:", err);
-    if (req.file) {
-      const fs = require("fs");
-      fs.unlinkSync(req.file.path);
-    }
+    if (req.file) fs.unlinkSync(req.file.path);
     res.status(500).json({ error: "Failed to upload CSV", details: err.message });
+  }
+});
+
+
+// ✅ Export PDF report
+app.post('/api/export/pdf', async (req, res) => {
+  const { samples, charts } = req.body;
+  const doc = new PDFDocument({ margin: 40 });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', 'attachment; filename=report.pdf');
+  doc.pipe(res);
+
+  doc.fontSize(18).text('Groundwater Analysis Report', { align: 'center' }).moveDown();
+
+  // Helper to convert base64 to buffer
+  const base64ToBuffer = (base64) => {
+    const base64Data = base64.replace(/^data:image\/\w+;base64,/, '');
+    return Buffer.from(base64Data, 'base64');
+  };
+
+  // Embed charts
+  if (charts?.pollutionChart) {
+    doc.text('Pollution Indices Comparison').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.pollutionChart), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  if (charts?.pieChart) {
+    doc.text('Contamination Distribution').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.pieChart), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  if (charts?.mapSnapshot) {
+    doc.text('Geospatial Visualization').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.mapSnapshot), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  // Sample details
+  samples.forEach((sample, index) => {
+    doc.fontSize(12).text(`Sample ${index + 1}: ${sample.sampleId}`);
+    doc.text(`Location: ${sample.village}, ${sample.district}, ${sample.state}`);
+    doc.text(`Coordinates: ${sample.latitude}, ${sample.longitude}`);
+    doc.text(`HPI: ${sample.indices.hpi} | MI: ${sample.indices.mi} | Cd: ${sample.indices.cd}`);
+    doc.text(`Status: ${sample.category}`);
+    doc.moveDown();
+  });
+
+  doc.end();
+});
+
+//Export sample PDF report for a single sample
+app.post('/api/export/sample-pdf', async (req, res) => {
+  const { sample, charts } = req.body;
+  const doc = new PDFDocument({ margin: 40 });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename=Sample_Report_${sample.sampleId}.pdf`);
+  doc.pipe(res);
+
+  const base64ToBuffer = (base64) => {
+    const data = base64.replace(/^data:image\/\w+;base64,/, '');
+    return Buffer.from(data, 'base64');
+  };
+
+  // Title
+  doc.fontSize(18).text(`Groundwater Sample Report`, { align: 'center' }).moveDown();
+  doc.fontSize(14).text(`Sample ID: ${sample.sampleId}`).moveDown();
+
+  // Location Details
+  doc.fontSize(14).text(' Location Details').moveDown(0.5);
+  doc.fontSize(12).text(`State: ${sample.state}`);
+  doc.text(`District: ${sample.district}`);
+  doc.text(`Block: ${sample.block}`);
+  doc.text(`Village: ${sample.village}`);
+  doc.text(`Latitude: ${sample.latitude}`);
+  doc.text(`Longitude: ${sample.longitude}`);
+  doc.text(`Geo Coordinates: [${sample.location?.coordinates?.join(', ')}]`);
+  doc.moveDown();
+
+  // Sampling Metadata
+  doc.fontSize(14).text(' Sampling Information').moveDown(0.5);
+  doc.fontSize(12).text(`Sampling Date: ${new Date(sample.samplingDate).toLocaleDateString()}`);
+  doc.text(`Well Type: ${sample.wellType}`);
+  doc.text(`Category: ${sample.category}`);
+  doc.moveDown();
+
+  // Water Quality Parameters
+  doc.fontSize(14).text(' Water Quality Parameters').moveDown(0.5);
+  const wq = sample.waterQuality;
+  doc.fontSize(12).text(`pH: ${wq.pH}`);
+  doc.text(`TDS: ${wq.tds} mg/L`);
+  doc.text(`Hardness: ${wq.hardness} mg/L`);
+  doc.text(`Fluoride: ${wq.fluoride} mg/L`);
+  doc.text(`Nitrate: ${wq.nitrate} mg/L`);
+  doc.moveDown();
+
+  // Heavy Metals
+  doc.fontSize(14).text(' Heavy Metals Concentration').moveDown(0.5);
+  const m = sample.metals;
+  doc.fontSize(12).text(`Lead: ${m.lead} ppm`);
+  doc.text(`Uranium: ${m.uranimun} ppm`);
+  doc.text(`Arsenic: ${m.arsenic} ppm`);
+  doc.text(`Iron: ${m.iron} ppm`);
+  doc.text(`Mercury: ${m.mercury} ppm`);
+  doc.text(`Cadmium: ${m.cadmium} ppm`);
+  doc.text(`Chromium: ${m.chromium} ppm`);
+  doc.moveDown();
+
+  // Pollution Indices
+  doc.fontSize(14).text(' Pollution Indices').moveDown(0.5);
+  const idx = sample.indices;
+  doc.fontSize(12).text(`HPI (Heavy Metal Pollution Index): ${idx.hpi}`);
+  doc.text(`MI (Metal Index): ${idx.mi}`);
+  doc.text(`Cd (Contamination Degree): ${idx.cd}`);
+  doc.moveDown();
+
+  // Charts Section
+  if (charts?.pollutionChart) {
+    doc.fontSize(14).text(' Water Quality Chart').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.pollutionChart), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  if (charts?.pieChart) {
+    doc.fontSize(14).text(' Heavy Metals Distribution').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.pieChart), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  if (charts?.indexChart) {
+    doc.fontSize(14).text(' Indices Comparison').moveDown(0.5);
+    doc.image(base64ToBuffer(charts.indexChart), { fit: [500, 300], align: 'center' }).moveDown();
+  }
+
+  doc.end();
+});
+
+app.get('/api/export/csv', async (req, res) => {
+  try {
+    const samples = await Sample.find({}).lean();
+
+    const formatted = samples.map((s) => ({
+      SampleID: s.sampleId,
+      State: s.state,
+      District: s.district,
+      Block: s.block,
+      Village: s.village,
+      Latitude: s.latitude,
+      Longitude: s.longitude,
+      SamplingDate: s.samplingDate ? new Date(s.samplingDate).toLocaleDateString() : '',
+      WellType: s.wellType,
+      Category: s.category,
+      pH: s.waterQuality?.pH,
+      TDS: s.waterQuality?.tds,
+      Hardness: s.waterQuality?.hardness,
+      Fluoride: s.waterQuality?.fluoride,
+      Nitrate: s.waterQuality?.nitrate,
+      Lead: s.metals?.lead,
+      Uranium: s.metals?.uranimun,
+      Arsenic: s.metals?.arsenic,
+      Iron: s.metals?.iron,
+      Mercury: s.metals?.mercury,
+      Cadmium: s.metals?.cadmium,
+      Chromium: s.metals?.chromium,
+      HPI: s.indices?.hpi,
+      MI: s.indices?.mi,
+      Cd: s.indices?.cd,
+    }));
+
+    const parser = new Parser();
+    const csv = parser.parse(formatted);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('Water_Analysis_Data.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error('CSV export error:', err);
+    res.status(500).json({ error: 'Failed to generate CSV', details: err.message });
   }
 });
 
@@ -296,88 +462,88 @@ app.get("/api/map", async (req, res) => {
 });
 
 // Update a sample
-app.put("/api/samples/:id", async (req, res) => {
-  try {
-    const sampleId = req.params.id;
-    const updates = req.body;
+// app.put("/api/samples/:id", async (req, res) => {
+//   try {
+//     const sampleId = req.params.id;
+//     const updates = req.body;
 
-    if (updates.latitude && updates.longitude) {
-      updates.location = { type: "Point", coordinates: [updates.longitude, updates.latitude] };
-    }
+//     if (updates.latitude && updates.longitude) {
+//       updates.location = { type: "Point", coordinates: [updates.longitude, updates.latitude] };
+//     }
 
-    // Recompute indices if metals changed
-    if (updates.metals) {
-      const indices = computeIndices({ metals: updates.metals });
-      updates.indices = {
-        hpi: indices.hpi,
-        mi: indices.mi,
-        cd: indices.cd,
-      };
-      updates.category = indices.category;
-    }
+//     // Recompute indices if metals changed
+//     if (updates.metals) {
+//       const indices = computeIndices({ metals: updates.metals });
+//       updates.indices = {
+//         hpi: indices.hpi,
+//         mi: indices.mi,
+//         cd: indices.cd,
+//       };
+//       updates.category = indices.category;
+//     }
 
-    const updated = await Sample.findByIdAndUpdate(sampleId, updates, { new: true });
-    res.json({ message: "✅ Sample updated", data: updated });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update sample" });
-  }
-});
+//     const updated = await Sample.findByIdAndUpdate(sampleId, updates, { new: true });
+//     res.json({ message: "✅ Sample updated", data: updated });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Failed to update sample" });
+//   }
+// });
 
 // ✅ Update a sample by sampleId (user-friendly)
-app.put("/api/samples/by-sampleid/:sampleId", async (req, res) => {
-  try {
-    const { sampleId } = req.params;
-    const updates = req.body;
+// app.put("/api/samples/by-sampleid/:sampleId", async (req, res) => {
+//   try {
+//     const { sampleId } = req.params;
+//     const updates = req.body;
 
-    // Find the sample by sampleId first
-    const existingSample = await Sample.findOne({ sampleId: sampleId });
+//     // Find the sample by sampleId first
+//     const existingSample = await Sample.findOne({ sampleId: sampleId });
     
-    if (!existingSample) {
-      return res.status(404).json({ error: `Sample with sampleId '${sampleId}' not found` });
-    }
+//     if (!existingSample) {
+//       return res.status(404).json({ error: `Sample with sampleId '${sampleId}' not found` });
+//     }
 
-    // Update location if coordinates changed
-    if (updates.latitude && updates.longitude) {
-      updates.location = { 
-        type: "Point", 
-        coordinates: [updates.longitude, updates.latitude] 
-      };
-    }
+//     // Update location if coordinates changed
+//     if (updates.latitude && updates.longitude) {
+//       updates.location = { 
+//         type: "Point", 
+//         coordinates: [updates.longitude, updates.latitude] 
+//       };
+//     }
 
-    // Recompute indices if metals or waterQuality changed
-    if (updates.metals || updates.waterQuality) {
-      // Merge existing data with updates for calculation
-      const dataForCalculation = {
-        metals: updates.metals || existingSample.metals,
-        waterQuality: updates.waterQuality || existingSample.waterQuality
-      };
+//     // Recompute indices if metals or waterQuality changed
+//     if (updates.metals || updates.waterQuality) {
+//       // Merge existing data with updates for calculation
+//       const dataForCalculation = {
+//         metals: updates.metals || existingSample.metals,
+//         waterQuality: updates.waterQuality || existingSample.waterQuality
+//       };
       
-      const indices = computeIndices(dataForCalculation);
-      updates.indices = {
-        hpi: indices.hpi,
-        mi: indices.mi,
-        cd: indices.cd,
-      };
-      updates.category = indices.category;
-    }
+//       const indices = computeIndices(dataForCalculation);
+//       updates.indices = {
+//         hpi: indices.hpi,
+//         mi: indices.mi,
+//         cd: indices.cd,
+//       };
+//       updates.category = indices.category;
+//     }
 
-    // Update the sample
-    const updated = await Sample.findOneAndUpdate(
-      { sampleId: sampleId }, 
-      updates, 
-      { new: true }
-    );
+//     // Update the sample
+//     const updated = await Sample.findOneAndUpdate(
+//       { sampleId: sampleId }, 
+//       updates, 
+//       { new: true }
+//     );
     
-    res.json({ 
-      message: `✅ Sample '${sampleId}' updated successfully`, 
-      data: updated 
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update sample" });
-  }
-});
+//     res.json({ 
+//       message: `✅ Sample '${sampleId}' updated successfully`, 
+//       data: updated 
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Failed to update sample" });
+//   }
+// });
 
 // Delete a sample
 app.delete("/api/samples/:id", async (req, res) => {

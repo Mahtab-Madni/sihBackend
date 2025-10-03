@@ -2,6 +2,8 @@ const mongoose=require("mongoose");
 
 const sampleSchema = new mongoose.Schema({
   sampleId: { type: String, required: true, unique: true },
+
+  // batchId: { type: String, required: true },
   
   // Location details
   state: { type: String },
@@ -21,17 +23,18 @@ const sampleSchema = new mongoose.Schema({
     tds: { type: Number, default: 0 },
     hardness: { type: Number, default: 0 },
     fluoride: { type: Number, default: 0 },
-    nitrate: { type: Number, default: 0 },
-    iron: { type: Number, default: 0 }
+    nitrate: { type: Number, default: 0 }
   },
   
   // Heavy metals
   metals: {
     lead: { type: Number, default: 0 },
-    cadmium: { type: Number, default: 0 },
+    uranimun: { type: Number, default: 0 },
     arsenic: { type: Number, default: 0 },
-    chromium: { type: Number, default: 0 },
-    mercury: { type: Number, default: 0 }
+    iron: { type: Number, default: 0 },
+    mercury: { type: Number, default: 0 },
+    cadmium: { type: Number, default: 0 },
+    chromium: { type: Number, default: 0 }
   },
   
   // Keep existing indices
